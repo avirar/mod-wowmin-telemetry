@@ -51,6 +51,7 @@
 #include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "StringConvert.h"
+#include "Transport.h"
 #include "TypeContainerVisitor.h"
 #include "Unit.h"
 #include "Vehicle.h"
@@ -359,6 +360,15 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 //     f32 z, f32 rotation x, y, z, w (a quaternion), u16 scale (x 1000), u8
 //     type (GameobjectTypes), u8 state (GOState: 0 active, e.g. a door open,
 //     1 ready, 2 alternative), u8 flags (1 gone), u8 reserved x3
+//
+// The map's moving transports (ships, zeppelins, trams, elevators) go in
+// their own datagrams with every snapshot while the map has any; they are
+// recreated on the map they travel through, so one that is gone is simply
+// not re-sent.
+//   header (24 bytes): "WMT1", then as for paths, with u16 transportCount
+//   transport (36 bytes): u32 guid, u32 entry, f32 x, f32 y, f32 z,
+//     f32 orientation, u32 pathProgress (0..10000 through the current route
+//     cycle), u32 displayId, u16 reserved x2
 //
 // The harmful auras on each unit (for wowmin's nameplates) go in their own
 // datagrams: when a unit's list changes and every STREAM_DEBUFF_REFRESH_MS
@@ -799,6 +809,18 @@ struct StreamGameObject
     bool gone = false;
 };
 
+struct StreamTransport
+{
+    uint32 guid = 0;
+    uint32 entry = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float orientation = 0.0f;
+    uint32 pathProgress = 0;
+    uint32 displayId = 0;
+};
+
 struct StreamPassenger
 {
     uint32 guid = 0;
@@ -1171,6 +1193,29 @@ std::vector<std::vector<uint8>> BuildGameObjectDatagrams(uint32 mapId, uint32 in
         AppendU16(entry, 0);
     }
     return PackEntries("WMG1", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildTransportDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                        std::vector<StreamTransport> const& transports)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(transports.size());
+    for (StreamTransport const& transport : transports)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(36);
+        AppendU32(entry, transport.guid);
+        AppendU32(entry, transport.entry);
+        AppendF32(entry, transport.x);
+        AppendF32(entry, transport.y);
+        AppendF32(entry, transport.z);
+        AppendF32(entry, transport.orientation);
+        AppendU32(entry, transport.pathProgress);
+        AppendU32(entry, transport.displayId);
+        AppendU16(entry, 0);
+        AppendU16(entry, 0);
+    }
+    return PackEntries("WMT1", mapId, instanceId, serverTimeMs, entries);
 }
 
 std::vector<std::vector<uint8>> BuildPassengerDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
@@ -1666,9 +1711,41 @@ struct TelemetryEvent
     uint32 amount;
 };
 
+// Where a live transport (ship, zeppelin, tram, elevator) is right now and
+// how far through its route it is, captured on the map's own thread.
+struct TelemetryTransport
+{
+    uint32 entry;
+    std::string name;
+    uint32 mapId;
+    uint32 instanceId;
+    float positionX;
+    float positionY;
+    float positionZ;
+    float orientation;
+    uint32 pathProgress;
+    uint32 displayId;
+};
+
 std::unordered_map<uint64, TelemetryInstance> instanceStates;
 std::unordered_map<uint64, std::deque<TelemetryDeath>> deathHistory;
 std::unordered_map<uint64, std::deque<TelemetryEvent>> eventHistory;
+// Keyed by the map's session key (instanceId 0 for continents), like the
+// other per-session state. Bounded by the live maps.
+std::unordered_map<uint64, std::vector<TelemetryTransport>> transportStates;
+
+// How far the transport is through its current cycle, 0-10000: both kinds
+// track milliseconds (motion transports since the route began, the
+// animation-based ones within the animation), so scale them by the cycle's
+// period.
+uint32 GetTransportCycleProgress(Transport const* transport)
+{
+    uint32 const period = transport->IsStaticTransport() ? static_cast<StaticTransport const*>(transport)->GetPeriod()
+                                                         : static_cast<MotionTransport const*>(transport)->GetPeriod();
+    if (!period)
+        return 0;
+    return uint32(uint64(transport->GetPathProgress() % period) * 10000 / period);
+}
 
 void AddTelemetryEvent(Player* actor, std::string type, Unit const* target, uint32 valueId, std::string valueName,
                        uint32 amount)
@@ -1900,6 +1977,19 @@ public:
             }
         }
 
+        std::vector<TelemetryTransport> transports;
+        {
+            std::lock_guard<std::mutex> lock(telemetryStateMutex);
+            for (auto const& [sessionKey, captured] : transportStates)
+            {
+                if (filterMap && uint32(sessionKey >> 32) != *mapId)
+                    continue;
+                if (filterInstance && uint32(sessionKey) != *instanceId)
+                    continue;
+                transports.insert(transports.end(), captured.begin(), captured.end());
+            }
+        }
+
         std::vector<TelemetryBattleground> battlegrounds;
         {
             std::lock_guard<std::mutex> lock(telemetryStateMutex);
@@ -1931,7 +2021,7 @@ public:
             }
         }
 
-        handler->SendSysMessage("WMAP_VERSION|7");
+        handler->SendSysMessage("WMAP_VERSION|8");
         for (TelemetryPlayer const& player : players)
         {
             handler->PSendSysMessage(
@@ -1944,6 +2034,14 @@ public:
                 player.healthPct, player.powerType, player.powerPct, player.targetGuid, player.targetType,
                 EscapeTelemetryField(player.targetName), player.roleMask, player.waitingForResurrect ? 1 : 0,
                 player.battlegroundRole, player.wmoGroupId, player.gender, player.stateFlags);
+        }
+
+        for (TelemetryTransport const& transport : transports)
+        {
+            handler->PSendSysMessage("WTRN|{}|{}|{}|{}|{:.3f}|{:.3f}|{:.3f}|{:.3f}|{}|{}", transport.entry,
+                                     EscapeTelemetryField(transport.name), transport.mapId, transport.instanceId,
+                                     transport.positionX, transport.positionY, transport.positionZ,
+                                     transport.orientation, transport.pathProgress, transport.displayId);
         }
 
         std::size_t worldStateCount = 0;
@@ -1984,8 +2082,9 @@ public:
                                      EscapeTelemetryField(event.actorName), event.targetGuid, event.targetType,
                                      EscapeTelemetryField(event.targetName), event.valueId,
                                      EscapeTelemetryField(event.valueName), event.amount);
-        handler->PSendSysMessage("WMAP_END|{}|{}|{}|{}|{}|{}|{}", players.size(), battlegrounds.size(), worldStateCount,
-                                 instances.size(), bossCount, deaths.size(), events.size());
+        handler->PSendSysMessage("WMAP_END|{}|{}|{}|{}|{}|{}|{}|{}", players.size(), transports.size(),
+                                 battlegrounds.size(), worldStateCount, instances.size(), bossCount, deaths.size(),
+                                 events.size());
         return true;
     }
 };
@@ -2012,11 +2111,12 @@ public:
 
     void OnDestroyMap(Map* map) override
     {
+        std::lock_guard<std::mutex> lock(telemetryStateMutex);
+        uint64 const sessionKey = GetSessionKey(map->GetId(), map->GetInstanceId());
+        transportStates.erase(sessionKey);
         if (!map->GetInstanceId())
             return;
 
-        std::lock_guard<std::mutex> lock(telemetryStateMutex);
-        uint64 const sessionKey = GetSessionKey(map->GetId(), map->GetInstanceId());
         sessionStartedAt.erase(sessionKey);
         mapUpdateTimers.erase(sessionKey);
         battlegroundStates.erase(sessionKey);
@@ -2034,10 +2134,14 @@ public:
 
     void OnMapUpdate(Map* map, uint32 diff) override
     {
-        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) || !map->GetInstanceId())
+        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled))
             return;
 
         uint64 const sessionKey = GetSessionKey(map->GetId(), map->GetInstanceId());
+        CaptureTransports(map, sessionKey);
+        if (!map->GetInstanceId())
+            return;
+
         if (telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::StreamEnabled))
             StreamPositions(map, sessionKey, diff);
         {
@@ -2158,6 +2262,15 @@ private:
         bool const sendMarkers = CollectMarkers(groupIds, *state, nowMs, markers);
         std::vector<StreamGameObject> gameObjects;
         CollectGameObjects(map, *state, nowMs, gameObjects);
+        std::vector<StreamTransport> transports;
+        for (Transport* transport : map->GetAllTransports())
+        {
+            if (!transport->IsInWorld())
+                continue;
+            transports.push_back({transport->GetGUID().GetCounter(), transport->GetEntry(), transport->GetPositionX(),
+                                  transport->GetPositionY(), transport->GetPositionZ(), transport->GetOrientation(),
+                                  GetTransportCycleProgress(transport), transport->GetDisplayId()});
+        }
         // Forget units that have gone, so a return is sent as new.
         auto gone = [&](auto const& entry)
         {
@@ -2192,6 +2305,9 @@ private:
                               host, port);
         if (!gameObjects.empty())
             streamSender.Send(BuildGameObjectDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), gameObjects),
+                              host, port);
+        if (!transports.empty())
+            streamSender.Send(BuildTransportDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), transports),
                               host, port);
         if (!debuffs.empty())
             streamSender.Send(BuildDebuffDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), debuffs), host,
@@ -2709,6 +2825,25 @@ private:
     }
 
 public:
+    // The map's live transports (ships, zeppelins, trams, elevators), read on
+    // the map's own thread for every live map so the telemetry command can
+    // report them without racing the map threads.
+    static void CaptureTransports(Map* map, uint64 sessionKey)
+    {
+        std::vector<TelemetryTransport> transports;
+        for (Transport* transport : map->GetAllTransports())
+        {
+            if (!transport->IsInWorld())
+                continue;
+            transports.push_back({transport->GetEntry(), transport->GetGOInfo()->name, map->GetId(),
+                                  map->GetInstanceId(), transport->GetPositionX(), transport->GetPositionY(),
+                                  transport->GetPositionZ(), transport->GetOrientation(),
+                                  GetTransportCycleProgress(transport), transport->GetDisplayId()});
+        }
+        std::lock_guard<std::mutex> lock(telemetryStateMutex);
+        transportStates[sessionKey] = std::move(transports);
+    }
+
     // Also called when a battleground ends (wowmin_telemetry_battlegroundscript).
     static void CaptureBattleground(BattlegroundMap* map, uint64 sessionKey)
     {

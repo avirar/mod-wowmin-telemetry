@@ -21,10 +21,11 @@ The response protocol is line-oriented and versioned. Long layouts below use `\`
 actual wire records occupy one line, with no continuation character:
 
 ```text
-WMAP_VERSION|7
+WMAP_VERSION|8
 WMAP|name|mapId|instanceId|x|y|z|orientation|level|race|class|accountId|isBot|alive|inCombat|\
 mapType|difficulty|sessionStartedAt|groupId|isRaidGroup|subgroup|teamId|healthPct|powerType|powerPct|\
 targetGuid|targetType|targetName|roleMask|waitingForResurrect|battlegroundRole|wmoGroupId|gender|stateFlags
+WTRN|entry|name|mapId|instanceId|x|y|z|orientation|pathProgress|displayId
 WBG|mapId|instanceId|battlegroundTypeId|status|elapsedMs|remainingMs|winner|\
 allianceScore|hordeScore|alliancePlayers|hordePlayers|allianceAlive|hordeAlive|nextResurrectMs|\
 allianceStrategy|hordeStrategy
@@ -34,12 +35,12 @@ WBOSS|mapId|instanceId|bossId|state|name
 WDEATH|mapId|instanceId|eventId|occurredAt|victimGuid|victimName|killerGuid|killerType|killerName
 WEVENT|mapId|instanceId|eventId|occurredAt|type|actorGuid|actorName|\
 targetGuid|targetType|targetName|valueId|valueName|amount
-WMAP_END|playerCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount
+WMAP_END|playerCount|transportCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount
 ```
 
-`WBG.winner` uses the core `PvPTeamId`: Horde (`0`), Alliance (`1`), or neutral/draw (`2`). Final
-battleground snapshots are captured by the battleground-end hook and remain queryable until map destruction.
-Version 7 adds authoritative battleground flag-carrier state (`32`) while a player holds the Warsong,
+Version 8 adds `WTRN` records: every live transport (ship, zeppelin, tram, elevator) per map, captured once
+per map update, with `pathProgress` 0–10000 through the transport's current route cycle and the game-object
+`displayId` so a reader can draw its model. Version 7 adds authoritative battleground flag-carrier state (`32`) while a player holds the Warsong,
 Silverwing, or Netherstorm flag aura. The bit clears with the aura when the flag is dropped, captured,
 returned, or lost on death. Version 6 adds gender plus a compact player-state bitmask: taxi flight (`1`),
 mounted (`2`), sapped (`4`), stunned (`8`), and Spirit of Redemption form (`16`); flying in the air (`64`) and
@@ -126,6 +127,7 @@ All layouts are little-endian and documented beside the code in `src/WowMinTelem
 | `WMU1` | Auras with spell art on each unit | When a unit's list changes, and every 5 seconds |
 | `WMV1` | Vehicle passengers and their seats | With every snapshot while any ride |
 | `WMG1` | Modeled game objects: banners, flags, doors, chests | On sight/change; refresh every 10 seconds |
+| `WMT1` | Moving transports: position, orientation, route progress, display | With every snapshot while the map has any |
 | `WMD1` | Harmful auras on each unit, for nameplates | When a unit's list changes, and every 3 seconds |
 | `WMR1` | Raid markers set by the instance's groups | When they change, and every 2 seconds |
 
@@ -175,10 +177,10 @@ or `WowMinTelemetry.Stream.Enable`. No database changes are required.
 ## WoWMin integration
 
 WoWMin should request `wowmin telemetry`, validate the `WMAP_VERSION` line, and verify that the
-`WMAP_END` player, battleground, world-state, instance, boss, death, and event counts match parsed
-rows. Database coordinates remain a fallback when the command is disabled or unavailable. WoWMin
-retains parsers for legacy responses and protocol versions 1–6 so the service and module can be deployed in
-either order. With a module that has no `wowmin stream` command, or the stream disabled, WoWMin's
+`WMAP_END` player, transport, battleground, world-state, instance, boss, death, and event counts match
+parsed rows. Database coordinates remain a fallback when the command is disabled or unavailable. WoWMin
+retains parsers for legacy responses and protocol versions 1–7 so the service and module can be deployed in
+either order; a v7 response simply carries no transports. With a module that has no `wowmin stream` command, or the stream disabled, WoWMin's
 Instance Watch carries on with the 1 second telemetry.
 
 ## License
