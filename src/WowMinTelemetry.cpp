@@ -374,7 +374,8 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 //   object (48 bytes): u32 guid, u32 entry, u32 displayId, f32 x, f32 y,
 //     f32 z, f32 rotation x, y, z, w (a quaternion), u16 scale (x 1000), u8
 //     type (GameobjectTypes), u8 state (GOState: 0 active, e.g. a door open,
-//     1 ready, 2 alternative), u8 flags (1 gone), u8 reserved x3
+//     1 ready, 2 alternative), u8 flags (1 gone), u8 healthPct (version 6:
+//     a destructible building's health, 0 otherwise), u16 reserved
 //
 // The map's moving transports (ships, zeppelins, trams, elevators) go in
 // their own datagrams with every snapshot while the map has any; they are
@@ -425,7 +426,7 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 //     Consecration; its cast-fired event then carries the area's duration in
 //     value, as a channel's does)
 
-constexpr uint8 STREAM_VERSION = 5;
+constexpr uint8 STREAM_VERSION = 6;
 constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
 constexpr std::size_t STREAM_MAX_SUBSCRIPTIONS = 64;
 constexpr std::size_t STREAM_MAX_DATAGRAM = 1200;
@@ -824,6 +825,7 @@ struct StreamGameObject
     uint8 type = 0;
     uint8 state = 0;
     bool gone = false;
+    uint8 healthPct = 0;
 };
 
 struct StreamTransport
@@ -1214,7 +1216,7 @@ std::vector<std::vector<uint8>> BuildGameObjectDatagrams(uint32 mapId, uint32 in
         AppendU8(entry, object.type);
         AppendU8(entry, object.state);
         AppendU8(entry, object.gone ? 1 : 0);
-        AppendU8(entry, 0);
+        AppendU8(entry, object.healthPct);
         AppendU16(entry, 0);
     }
     return PackEntries("WMG1", mapId, instanceId, serverTimeMs, entries);
@@ -2501,6 +2503,10 @@ private:
             uint32 const guid = object->GetGUID().GetCounter();
             seen.insert(guid);
             G3D::Quat const rotation = object->GetWorldRotation();
+            // Only destructible buildings (IoC's gates and walls) carry
+            // health; the gameobject's anim progress tracks its fraction.
+            uint8 const healthPct =
+                type == GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING ? uint8(object->GetGoAnimProgress() * 100 / 255) : 0;
             StreamGameObject entry{guid,
                                    object->GetEntry(),
                                    object->GetDisplayId(),
@@ -2511,10 +2517,12 @@ private:
                                    uint16(std::clamp(object->GetObjectScale() * 1000.0f, 0.0f, 65535.0f)),
                                    uint8(type),
                                    uint8(object->GetGoState()),
-                                   false};
+                                   false,
+                                   healthPct};
             std::size_t signature = std::hash<uint32>{}(entry.displayId);
             auto mix = [&](auto value) { MixSignature(signature, value); };
             mix(entry.state);
+            mix(entry.healthPct);
             mix(entry.scale);
             mix(int32(entry.x * 10.0f));
             mix(int32(entry.y * 10.0f));

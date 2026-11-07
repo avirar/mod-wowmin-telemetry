@@ -100,7 +100,10 @@ subscriptions, queued combat events, and per-stream caches. Re-enabling requires
 text history is unaffected. Failed destination validation/socket opening is retried at most once every five seconds
 while watched; changing host or port bypasses the cooldown. No alternate destination is substituted.
 
-Every datagram starts with a four-byte magic and a version byte (currently 5). Stream version 5 adds `WMV2`: every
+Every datagram starts with a four-byte magic and a version byte (currently 6). Stream version 6 gives the
+`WMG1` object entry's reserved byte meaning: a destructible building's (IoC's gates and walls') health
+percent, 0 for objects without health, so a damaged gate reads below 100 before it is destroyed. Stream
+version 5 adds `WMV2`: every
 minimap-blipping vehicle on the watched map, occupied or not, with its current blip, so an unoccupied vehicle still
 shows and its blip flips variant as riders board and leave; its pose is the vehicle's own creature record. Stream
 version 4 adds the vehicle's minimap blip byte to each `WMV1` passenger (13-byte entries). Stream version 3 keeps the v2 byte
@@ -110,9 +113,10 @@ and its 24-bit counter in bits 0–23 (creature `0x30`, pet `0x40`, vehicle `0x5
 player/creature flags distinguish the player and non-player namespaces. Game-object records retain their own low-GUID
 namespace. These are runtime stream identities, not database spawn IDs. Text telemetry is unchanged.
 
-Deploy the v5-capable WoWMin reader before this module; it accepts v1 through v5 for every packet
-family (v5's only change is the added `WMV2` magic; every other family keeps its v4 layout). Older readers
-reject v5 rather than mixing incompatible entries. Live-view caches may
+Deploy the v6-capable WoWMin reader before this module; it accepts v1 through v6 for every packet
+family (v6 reinterprets one of the `WMG1` entry's reserved bytes as the object's health percent, so the
+entry stays 48 bytes; v5's only other change was the added `WMV2` magic). Older readers
+reject v6 rather than mixing incompatible entries. Live-view caches may
 retain old IDs until their normal expiry after a module upgrade. Stream version 2 adds the core LFG
 role mask to each `WMS1` player record so roles remain available with WoWMin's character-database
 snapshot fallback. Unlike text telemetry, stream roles may use mod-playerbots
