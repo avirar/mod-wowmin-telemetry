@@ -263,11 +263,12 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 // WowMinTelemetry.Stream.IntervalMs. The world thread sends them after maps
 // join, only to the configured destination (never one chosen by a command).
 //
-// Datagram, little-endian. In version 3, every unit GUID field below uses
+// Datagram, little-endian. In version 4, every unit GUID field below uses
 // GetStreamUnitId: players keep their low GUID; non-players carry the low
 // byte of HighGuid in bits 24..31 and their counter in bits 0..23. The
 // existing player/creature flags still distinguish those two namespaces.
 // Game-object records have their own namespace and retain their low GUID.
+// Version 4 adds the vehicle's minimap blip to each WMV1 passenger entry.
 //   header (28 bytes): "WMS1", u8 version, u8 part, u8 partCount, u8 reserved,
 //     u32 mapId, u32 instanceId, u32 sequence, u32 serverTimeMs,
 //     u16 playerCount, u16 reserved
@@ -347,9 +348,23 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 // mammoth) go in their own datagrams, with every snapshot while any are, so
 // wowmin can seat or hide them; a player missing from them is on foot.
 //   header (24 bytes): "WMV1", then as for paths, with u16 passengerCount
-//   passenger (12 bytes): u32 guid, u32 vehicleGuid, u8 flags (1 the vehicle
-//     is a creature, not a player, 2 the seat hides its passenger, 4 the
-//     seat drives the vehicle), i8 seat index, u16 reserved
+//   passenger (13 bytes from version 4, 12 before): u32 guid, u32
+//     vehicleGuid, u8 flags (1 the vehicle is a creature, not a player, 2
+//     the seat hides its passenger, 4 the seat drives the vehicle), i8 seat
+//     index, u8 blip (the vehicle's minimap blip, the client's
+//     s_vehicleTextures index: 0 the ground vehicle, unoccupied, 1 the
+//     ground vehicle, occupied, 2 the air vehicle, unoccupied, 3 the air
+//     vehicle, occupied, 5 the faction air vehicles; 0xFF: the vehicle
+//     blips nothing), u16 reserved
+//
+// Every vehicle that blips on the minimap, occupied or not, goes in its own
+// datagram with every snapshot while the map has one, so wowmin shows
+// unoccupied vehicles too and flips a blip's variant as riders board and
+// leave.
+//   header (24 bytes): "WMV2", then as for paths, with u16 vehicleCount
+//   vehicle (9 bytes): u32 vehicleGuid (the vehicle's own unit ID, as in
+//     WMV1), u8 blip (the client's s_vehicleTextures index, as in WMV1;
+//     never 0xFF here), u32 reserved
 //
 // Game objects with a model (battleground banners and flags, doors, chests)
 // go in their own datagrams too, whenever one appears or changes and every
@@ -410,7 +425,7 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 //     Consecration; its cast-fired event then carries the area's duration in
 //     value, as a channel's does)
 
-constexpr uint8 STREAM_VERSION = 3;
+constexpr uint8 STREAM_VERSION = 5;
 constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
 constexpr std::size_t STREAM_MAX_SUBSCRIPTIONS = 64;
 constexpr std::size_t STREAM_MAX_DATAGRAM = 1200;
@@ -440,6 +455,8 @@ constexpr uint64 STREAM_MARKER_REFRESH_MS = 2000;
 constexpr uint64 STREAM_GROUP_MARKERS_FORGET_MS = 10000;
 constexpr std::size_t STREAM_MAX_EVENTS = 256;
 constexpr std::size_t STREAM_MAX_UNIT_AURAS = 32;
+// Vehicle.dbc's flags bit: the vehicle blips on the client's minimap.
+constexpr uint32 VEHICLE_FLAG_SHOW_ON_MINIMAP = 0x10000000;
 
 enum StreamEventKind : uint8
 {
@@ -827,6 +844,14 @@ struct StreamPassenger
     uint32 vehicleGuid = 0;
     uint8 flags = 0;
     int8 seat = 0;
+    uint8 blip = 0xFF;
+};
+
+// A vehicle that blips on the minimap, occupied or not (WMV2).
+struct StreamVehicleBlip
+{
+    uint32 guid = 0;
+    uint8 blip = 0xFF;
 };
 
 struct StreamUnitAuras
@@ -1226,14 +1251,31 @@ std::vector<std::vector<uint8>> BuildPassengerDatagrams(uint32 mapId, uint32 ins
     for (StreamPassenger const& passenger : passengers)
     {
         std::vector<uint8>& entry = entries.emplace_back();
-        entry.reserve(12);
+        entry.reserve(13);
         AppendU32(entry, passenger.guid);
         AppendU32(entry, passenger.vehicleGuid);
         AppendU8(entry, passenger.flags);
         AppendU8(entry, uint8(passenger.seat));
+        AppendU8(entry, passenger.blip);
         AppendU16(entry, 0);
     }
     return PackEntries("WMV1", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildVehicleBlipDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                          std::vector<StreamVehicleBlip> const& vehicles)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(vehicles.size());
+    for (StreamVehicleBlip const& vehicle : vehicles)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(9);
+        AppendU32(entry, vehicle.guid);
+        AppendU8(entry, vehicle.blip);
+        AppendU32(entry, 0);
+    }
+    return PackEntries("WMV2", mapId, instanceId, serverTimeMs, entries);
 }
 
 std::vector<std::vector<uint8>> BuildUnitAuraDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
@@ -2257,7 +2299,8 @@ private:
                                               [&](StreamPlayer const& player) { return player.guid == entry.first; });
                       });
         std::vector<StreamCreature> creatures;
-        CollectCreatures(map, *state, nowMs, creatures, paths, appearances, unitAuras, debuffs);
+        std::vector<StreamVehicleBlip> vehicleBlips;
+        CollectCreatures(map, *state, nowMs, creatures, paths, appearances, unitAuras, debuffs, vehicleBlips);
         std::vector<StreamMarker> markers;
         bool const sendMarkers = CollectMarkers(groupIds, *state, nowMs, markers);
         std::vector<StreamGameObject> gameObjects;
@@ -2303,6 +2346,9 @@ private:
         if (!passengers.empty())
             streamSender.Send(BuildPassengerDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), passengers),
                               host, port);
+        if (!vehicleBlips.empty())
+            streamSender.Send(
+                BuildVehicleBlipDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), vehicleBlips), host, port);
         if (!gameObjects.empty())
             streamSender.Send(BuildGameObjectDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), gameObjects),
                               host, port);
@@ -2498,6 +2544,35 @@ private:
         }
     }
 
+    // The vehicle's minimap blip as the client's s_vehicleTextures index
+    // (0xFF: it blips nothing): ground and air pick the occupied variant,
+    // the faction air vehicles are fixed, and only a vehicle whose DBC row
+    // shows on the minimap blips at all.
+    static uint8 VehicleBlip(Vehicle* vehicle)
+    {
+        if (VehicleEntry const* info = vehicle->GetVehicleInfo())
+        {
+            if (info->m_flags & VEHICLE_FLAG_SHOW_ON_MINIMAP)
+            {
+                bool const occupied = vehicle->IsVehicleInUse();
+                switch (info->m_uiLocomotionType)
+                {
+                    case 0:
+                        return occupied ? 1 : 0;
+                    case 1:
+                        return occupied ? 3 : 2;
+                    case 3:
+                        return 5;
+                    case 4:
+                        return 6;
+                    default:
+                        break;
+                }
+            }
+        }
+        return 0xFF;
+    }
+
     // Adds the player to `passengers` if they ride a vehicle.
     static void CollectPassenger(Player* player, std::vector<StreamPassenger>& passengers)
     {
@@ -2513,8 +2588,8 @@ private:
             if (seat->m_flags & VEHICLE_SEAT_FLAG_CAN_CONTROL)
                 flags |= 4;
         }
-        passengers.push_back(
-            {GetStreamUnitId(player->GetGUID()), GetStreamUnitId(base->GetGUID()), flags, player->GetTransSeat()});
+        passengers.push_back({GetStreamUnitId(player->GetGUID()), GetStreamUnitId(base->GetGUID()), flags,
+                              player->GetTransSeat(), VehicleBlip(vehicle)});
     }
 
     // Adds the unit's harmful auras to `units` when the list changed (spells or
@@ -2752,7 +2827,7 @@ private:
     static void CollectCreatures(Map* map, StreamSessionState& state, uint64 nowMs,
                                  std::vector<StreamCreature>& creatures, std::vector<StreamPath>& paths,
                                  std::vector<StreamAppearance>& appearances, std::vector<StreamUnitAuras>& unitAuras,
-                                 std::vector<StreamUnitDebuffs>& debuffs)
+                                 std::vector<StreamUnitDebuffs>& debuffs, std::vector<StreamVehicleBlip>& vehicleBlips)
     {
         std::vector<Creature*> present;
         StreamCreatureCollector collector(present);
@@ -2818,6 +2893,15 @@ private:
             CollectAppearance(creature, state, nowMs, appearances);
             CollectAuras(creature, state, nowMs, unitAuras);
             CollectDebuffs(creature, state, nowMs, debuffs);
+            // The minimap blips of every vehicle on the map, occupied or not
+            // (WMV2), so an unoccupied one still shows and the blip flips
+            // variant as riders board and leave; its pose is the creature's.
+            if (Vehicle* vehicle = creature->GetVehicleKit())
+            {
+                uint8 const blip = VehicleBlip(vehicle);
+                if (blip != 0xFF)
+                    vehicleBlips.push_back({guid, blip});
+            }
         }
         // Forget despawned creatures, so a respawn is sent as new.
         std::erase_if(state.creatures, [&](auto const& entry) { return !seen.contains(entry.first); });

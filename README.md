@@ -100,17 +100,22 @@ subscriptions, queued combat events, and per-stream caches. Re-enabling requires
 text history is unaffected. Failed destination validation/socket opening is retried at most once every five seconds
 while watched; changing host or port bypasses the cooldown. No alternate destination is substituted.
 
-Every datagram starts with a four-byte magic and a version byte (currently 3). Stream version 3 keeps the v2 byte
+Every datagram starts with a four-byte magic and a version byte (currently 5). Stream version 5 adds `WMV2`: every
+minimap-blipping vehicle on the watched map, occupied or not, with its current blip, so an unoccupied vehicle still
+shows and its blip flips variant as riders board and leave; its pose is the vehicle's own creature record. Stream
+version 4 adds the vehicle's minimap blip byte to each `WMV1` passenger (13-byte entries). Stream version 3 keeps the v2 byte
 layouts but makes non-player unit IDs unique across creature, pet, and vehicle GUID types. Every unit-reference field
 uses the same ID: player low GUIDs remain unchanged; non-player IDs contain the low byte of `HighGuid` in bits 24–31
 and its 24-bit counter in bits 0–23 (creature `0x30`, pet `0x40`, vehicle `0x50` in the upper byte). The existing
 player/creature flags distinguish the player and non-player namespaces. Game-object records retain their own low-GUID
 namespace. These are runtime stream identities, not database spawn IDs. Text telemetry is unchanged.
 
-Deploy the v3-capable WoWMin reader before this module; it accepts v1, v2, and v3 for every packet family. Older readers
-reject v3 rather than mixing incompatible IDs. Live-view caches may retain old IDs until their normal expiry after a
-module upgrade. Stream version 2 adds the core LFG role mask to each `WMS1` player record so roles remain available
-with WoWMin's character-database snapshot fallback. Unlike text telemetry, stream roles may use mod-playerbots
+Deploy the v5-capable WoWMin reader before this module; it accepts v1 through v5 for every packet
+family (v5's only change is the added `WMV2` magic; every other family keeps its v4 layout). Older readers
+reject v5 rather than mixing incompatible entries. Live-view caches may
+retain old IDs until their normal expiry after a module upgrade. Stream version 2 adds the core LFG
+role mask to each `WMS1` player record so roles remain available with WoWMin's character-database
+snapshot fallback. Unlike text telemetry, stream roles may use mod-playerbots
 classification for grouped players with no assigned combat role. Ungrouped players remain `0`. Stream roles and the
 group IDs used internally for raid markers come from world-thread snapshots. Initial stream roles are `0` until
 refreshed; raid markers can need a further snapshot.
@@ -125,7 +130,8 @@ All layouts are little-endian and documented beside the code in `src/WowMinTelem
 | `WMA1` | Appearance, mount, sheath state, 19 item displays | On sight/change; refresh every 5 seconds |
 | `WME1` | Combat events: casts, notable auras, swings, damage, heals | With the next snapshot after they happen |
 | `WMU1` | Auras with spell art on each unit | When a unit's list changes, and every 5 seconds |
-| `WMV1` | Vehicle passengers and their seats | With every snapshot while any ride |
+| `WMV1` | Vehicle passengers, their seats, and each vehicle's minimap blip | With every snapshot while any ride |
+| `WMV2` | Every minimap-blipping vehicle (occupied or not) and its current blip | With every snapshot while the map has one |
 | `WMG1` | Modeled game objects: banners, flags, doors, chests | On sight/change; refresh every 10 seconds |
 | `WMT1` | Moving transports: position, orientation, route progress, display | With every snapshot while the map has any |
 | `WMD1` | Harmful auras on each unit, for nameplates | When a unit's list changes, and every 3 seconds |
