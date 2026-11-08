@@ -27,6 +27,7 @@ mapType|difficulty|sessionStartedAt|groupId|isRaidGroup|subgroup|teamId|healthPc
 targetGuid|targetType|targetName|roleMask|waitingForResurrect|battlegroundRole|wmoGroupId|gender|stateFlags
 WTRN|entry|name|mapId|instanceId|x|y|z|orientation|pathProgress|displayId|guid|period|flags|pathTime|keyFrames
 WOPW|worldStateId|value
+WCPT|mapId|zoneId|entry|x|y|z|slider|maxValue
 WWG|active|timerSeconds|defender|attacker
 WWGO|entry|x|y|z|health|maxHealth|damagedNumHits
 WWGV|guid|entry|x|y|z|orientation|health|maxHealth
@@ -40,10 +41,12 @@ WBOSS|mapId|instanceId|bossId|state|name
 WDEATH|mapId|instanceId|eventId|occurredAt|victimGuid|victimName|killerGuid|killerType|killerName
 WEVENT|mapId|instanceId|eventId|occurredAt|type|actorGuid|actorName|\
 targetGuid|targetType|targetName|valueId|valueName|amount
-WMAP_END|playerCount|transportCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount|transportPassengerCount|outdoorWorldStateCount|wintergraspStructureCount|wintergraspVehicleCount
+WMAP_END|playerCount|transportCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount|transportPassengerCount|outdoorWorldStateCount|wintergraspStructureCount|wintergraspVehicleCount|capturePointCount
 ```
 
-Version 10 adds the outdoor PvP overlay: `WOPW` records carry every outdoor PvP world state (the client's own
+Version 11 adds `WCPT`: each outdoor PvP capture point's position, entry, and live slider
+(`OPvPCapturePoint::GetSlider` / `GetMaxValue`, the 0..100 capture phase the client's capture bar shows; it is
+normally sent only to players standing in the objective), and adds a capture-point count to `WMAP_END`. Version 10 adds the outdoor PvP overlay: `WOPW` records carry every outdoor PvP world state (the client's own
 POI icon selector: a zone's capture points, keeps, workshops, and towers), `WWG` carries Wintergrasp's
 battlefield state (active, timer in milliseconds, defender, attacker), `WWGO` each destructible Wintergrasp wall,
 tower, or door with its real hit points, and `WWGV` each Wintergrasp siege vehicle while one exists.

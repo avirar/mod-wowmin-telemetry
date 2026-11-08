@@ -2248,7 +2248,7 @@ public:
             }
         }
 
-        handler->SendSysMessage("WMAP_VERSION|10");
+        handler->SendSysMessage("WMAP_VERSION|11");
         for (TelemetryPlayer const& player : players)
         {
             handler->PSendSysMessage(
@@ -2321,6 +2321,31 @@ public:
             handler->PSendSysMessage("WOPW|{}|{}", id, value);
             ++outdoorWorldStateCount;
         }
+        // The capture points' own progress: OPvPCapturePoint's slider (the
+        // 0..100 phase the client's capture bar shows) is sent only to
+        // nearby players, so it never reaches the world states. The spawn
+        // data is immutable and always registered, unlike the map object,
+        // which is only present while the zone's grid is loaded.
+        std::size_t capturePointCount = 0;
+        for (uint32 zoneId : {AREA_EASTERN_PLAGUELANDS, AREA_SILITHUS, AREA_HELLFIRE_PENINSULA, AREA_NAGRAND,
+                              AREA_TEROKKAR_FOREST, AREA_ZANGARMARSH})
+        {
+            OutdoorPvP* pvp = sOutdoorPvPMgr->GetOutdoorPvPToZoneId(zoneId);
+            if (!pvp)
+                continue;
+            for (auto const& [spawnId, point] : pvp->GetCapturePoints())
+            {
+                if (!point || !spawnId)
+                    continue;
+                GameObjectData const* data = sObjectMgr->GetGameObjectData(spawnId);
+                if (!data)
+                    continue;
+                handler->PSendSysMessage("WCPT|{}|{}|{}|{:.3f}|{:.3f}|{:.3f}|{:.3f}|{:.3f}", data->mapid, zoneId,
+                                         data->id, data->posX, data->posY, data->posZ, point->GetSlider(),
+                                         point->GetMaxValue());
+                ++capturePointCount;
+            }
+        }
         if (wintergrasp)
         {
             handler->PSendSysMessage("WWG|{}|{}|{}|{}", wintergrasp->IsWarTime() ? 1 : 0, wintergrasp->GetTimer(),
@@ -2375,10 +2400,10 @@ public:
                                      EscapeTelemetryField(event.actorName), event.targetGuid, event.targetType,
                                      EscapeTelemetryField(event.targetName), event.valueId,
                                      EscapeTelemetryField(event.valueName), event.amount);
-        handler->PSendSysMessage("WMAP_END|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", players.size(), transports.size(),
+        handler->PSendSysMessage("WMAP_END|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", players.size(), transports.size(),
                                  battlegrounds.size(), worldStateCount, instances.size(), bossCount, deaths.size(),
                                  events.size(), transportPassengerCount, outdoorWorldStateCount,
-                                 wintergraspStructureCount, wintergraspVehicleCount);
+                                 wintergraspStructureCount, wintergraspVehicleCount, capturePointCount);
         return true;
     }
 };
