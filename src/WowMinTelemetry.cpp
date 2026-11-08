@@ -12,6 +12,8 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,6 +27,7 @@
 #include <vector>
 
 #include "AbstractFollower.h"
+#include "BattlefieldMgr.h"
 #include "Battleground.h"
 #include "Chat.h"
 #include "ConfigValueCache.h"
@@ -44,6 +47,7 @@
 #include "MovementGenerator.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
+#include "OutdoorPvPMgr.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "Spell.h"
@@ -1889,6 +1893,62 @@ struct TelemetryTransport
     std::vector<TelemetryTransportPassenger> passengers;
 };
 
+// Wintergrasp's destructible structures and siege vehicles (map 571),
+// captured on the map thread. The battlefield's timer and the world states
+// that select the client's POI icons are world-owned and read in the
+// command instead.
+struct TelemetryWintergraspStructure
+{
+    uint32 entry;
+    float x;
+    float y;
+    float z;
+    uint32 health;
+    uint32 maxHealth;
+    uint32 damagedNumHits;
+};
+
+struct TelemetryWintergraspVehicle
+{
+    uint32 guid;
+    uint32 entry;
+    float x;
+    float y;
+    float z;
+    float orientation;
+    uint32 health;
+    uint32 maxHealth;
+};
+
+struct TelemetryWintergrasp
+{
+    uint32 mapId = 0;
+    uint32 instanceId = 0;
+    std::vector<TelemetryWintergraspStructure> structures;
+    std::vector<TelemetryWintergraspVehicle> vehicles;
+};
+
+std::unordered_map<uint64, TelemetryWintergrasp> wintergraspStates;
+std::unordered_map<uint64, uint32> wintergraspScanTimers;
+
+// How often the map thread rescans Wintergrasp's structures and vehicles.
+constexpr uint32 WG_SCAN_INTERVAL_MS = 2000;
+
+// Wintergrasp's destructible building entries (the core's
+// WGGameObjectBuilding: walls, keep towers, south towers, and doors; each
+// entry is unique) and its siege vehicle entries.
+constexpr uint32 WG_STRUCTURE_ENTRIES[] = {190219, 190220, 191795, 191796, 191799, 191800, 191801, 191802,
+                                           191803, 191804, 191806, 191807, 191808, 191809, 190369, 190370,
+                                           190371, 190372, 190374, 190376, 190221, 190373, 190377, 190378,
+                                           191797, 191798, 191805, 190356, 190357, 190358, 190375, 191810};
+constexpr uint32 WG_VEHICLE_ENTRIES[] = {28312, 32627, 27881, 28094, 28319, 32629, 28366};
+
+template <std::size_t N>
+bool MatchesEntry(uint32 const (&entries)[N], uint32 entry)
+{
+    return std::find(std::begin(entries), std::end(entries), entry) != std::end(entries);
+}
+
 std::unordered_map<uint64, TelemetryInstance> instanceStates;
 std::unordered_map<uint64, std::deque<TelemetryDeath>> deathHistory;
 std::unordered_map<uint64, std::deque<TelemetryEvent>> eventHistory;
@@ -2188,7 +2248,7 @@ public:
             }
         }
 
-        handler->SendSysMessage("WMAP_VERSION|9");
+        handler->SendSysMessage("WMAP_VERSION|10");
         for (TelemetryPlayer const& player : players)
         {
             handler->PSendSysMessage(
@@ -2239,6 +2299,60 @@ public:
                 ++worldStateCount;
             }
         }
+        // Outdoor PvP: the world states that select the client's own POI
+        // icons (Hellfire's towers, the Plaguelands' towers, Zangarmarsh's,
+        // Terokkar's, Silithus's, Nagrand's Halaa) plus Wintergrasp's, whose
+        // battlefield timer also goes out here. World owned, read in the
+        // world update; the module never touches map objects here.
+        WorldPackets::WorldState::InitWorldStates outdoorPvpStates;
+        for (uint32 zoneId : {AREA_EASTERN_PLAGUELANDS, AREA_SILITHUS, AREA_HELLFIRE_PENINSULA, AREA_NAGRAND,
+                              AREA_TEROKKAR_FOREST, AREA_ZANGARMARSH})
+            if (OutdoorPvP* pvp = sOutdoorPvPMgr->GetOutdoorPvPToZoneId(zoneId))
+                pvp->FillInitialWorldStates(outdoorPvpStates);
+        Battlefield* wintergrasp = sBattlefieldMgr->GetBattlefieldByBattleId(BATTLEFIELD_BATTLEID_WG);
+        if (wintergrasp)
+            wintergrasp->FillInitialWorldStates(outdoorPvpStates);
+        std::map<uint32, uint32> outdoorPvpValues;
+        for (WorldPackets::WorldState::InitWorldStates::WorldStateInfo const& state : outdoorPvpStates.Worldstates)
+            outdoorPvpValues[state.VariableID] = state.Value;
+        std::size_t outdoorWorldStateCount = 0;
+        for (auto const& [id, value] : outdoorPvpValues)
+        {
+            handler->PSendSysMessage("WOPW|{}|{}", id, value);
+            ++outdoorWorldStateCount;
+        }
+        if (wintergrasp)
+        {
+            handler->PSendSysMessage("WWG|{}|{}|{}|{}", wintergrasp->IsWarTime() ? 1 : 0, wintergrasp->GetTimer(),
+                                     uint32(wintergrasp->GetDefenderTeam()), uint32(wintergrasp->GetAttackerTeam()));
+        }
+        std::vector<TelemetryWintergrasp> wintergraspSnapshots;
+        {
+            std::lock_guard<std::mutex> lock(telemetryStateMutex);
+            wintergraspSnapshots.reserve(wintergraspStates.size());
+            for (auto const& [key, snapshot] : wintergraspStates)
+                wintergraspSnapshots.push_back(snapshot);
+        }
+        std::size_t wintergraspStructureCount = 0;
+        std::size_t wintergraspVehicleCount = 0;
+        for (TelemetryWintergrasp const& snapshot : wintergraspSnapshots)
+        {
+            for (TelemetryWintergraspStructure const& structure : snapshot.structures)
+            {
+                handler->PSendSysMessage("WWGO|{}|{:.3f}|{:.3f}|{:.3f}|{}|{}|{}", structure.entry, structure.x,
+                                         structure.y, structure.z, structure.health, structure.maxHealth,
+                                         structure.damagedNumHits);
+                ++wintergraspStructureCount;
+            }
+            for (TelemetryWintergraspVehicle const& vehicle : snapshot.vehicles)
+            {
+                handler->PSendSysMessage("WWGV|{}|{}|{:.3f}|{:.3f}|{:.3f}|{:.3f}|{}|{}", vehicle.guid, vehicle.entry,
+                                         vehicle.x, vehicle.y, vehicle.z, vehicle.orientation, vehicle.health,
+                                         vehicle.maxHealth);
+                ++wintergraspVehicleCount;
+            }
+        }
+
         std::size_t bossCount = 0;
         for (TelemetryInstance const& instance : instances)
         {
@@ -2261,9 +2375,10 @@ public:
                                      EscapeTelemetryField(event.actorName), event.targetGuid, event.targetType,
                                      EscapeTelemetryField(event.targetName), event.valueId,
                                      EscapeTelemetryField(event.valueName), event.amount);
-        handler->PSendSysMessage("WMAP_END|{}|{}|{}|{}|{}|{}|{}|{}|{}", players.size(), transports.size(),
+        handler->PSendSysMessage("WMAP_END|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", players.size(), transports.size(),
                                  battlegrounds.size(), worldStateCount, instances.size(), bossCount, deaths.size(),
-                                 events.size(), transportPassengerCount);
+                                 events.size(), transportPassengerCount, outdoorWorldStateCount,
+                                 wintergraspStructureCount, wintergraspVehicleCount);
         return true;
     }
 };
@@ -2293,6 +2408,8 @@ public:
         std::lock_guard<std::mutex> lock(telemetryStateMutex);
         uint64 const sessionKey = GetSessionKey(map->GetId(), map->GetInstanceId());
         transportStates.erase(sessionKey);
+        wintergraspStates.erase(sessionKey);
+        wintergraspScanTimers.erase(sessionKey);
         if (!map->GetInstanceId())
             return;
 
@@ -2318,6 +2435,7 @@ public:
 
         uint64 const sessionKey = GetSessionKey(map->GetId(), map->GetInstanceId());
         CaptureTransports(map, sessionKey);
+        CaptureWintergrasp(map, sessionKey, diff);
         if (!map->GetInstanceId())
             return;
 
@@ -3152,6 +3270,58 @@ public:
         }
         std::lock_guard<std::mutex> lock(telemetryStateMutex);
         transportStates[sessionKey] = std::move(transports);
+    }
+
+    // Wintergrasp (Northrend outdoors): its destructible walls, towers, and
+    // doors with their real hit points, and the siege vehicles while they
+    // exist. Read on the map thread; the command merges the battlefield's
+    // world states and timer from the world thread.
+    static void CaptureWintergrasp(Map* map, uint64 sessionKey, uint32 diff)
+    {
+        if (map->GetId() != MAP_NORTHREND || map->GetInstanceId())
+            return;
+
+        uint32& scanTimer = wintergraspScanTimers[sessionKey];
+        scanTimer += diff;
+        if (scanTimer < WG_SCAN_INTERVAL_MS)
+            return;
+        scanTimer = 0;
+
+        TelemetryWintergrasp state;
+        state.mapId = map->GetId();
+        state.instanceId = map->GetInstanceId();
+
+        std::vector<GameObject*> objects;
+        StreamGameObjectCollector objectCollector(objects);
+        TypeContainerVisitor<StreamGameObjectCollector, MapStoredObjectTypesContainer> objectVisitor(objectCollector);
+        objectVisitor.Visit(map->GetObjectsStore());
+        for (GameObject* object : objects)
+        {
+            if (!object->IsInWorld() || object->GetGoType() != GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING ||
+                !MatchesEntry(WG_STRUCTURE_ENTRIES, object->GetEntry()))
+                continue;
+            state.structures.push_back({object->GetEntry(), object->GetPositionX(), object->GetPositionY(),
+                                        object->GetPositionZ(), object->GetGOValue()->Building.Health,
+                                        object->GetGOValue()->Building.MaxHealth,
+                                        object->GetGOInfo()->building.damagedNumHits});
+        }
+
+        std::vector<Creature*> creatures;
+        StreamCreatureCollector creatureCollector(creatures);
+        TypeContainerVisitor<StreamCreatureCollector, MapStoredObjectTypesContainer> creatureVisitor(creatureCollector);
+        creatureVisitor.Visit(map->GetObjectsStore());
+        for (Creature* creature : creatures)
+        {
+            if (!creature->IsInWorld() || !MatchesEntry(WG_VEHICLE_ENTRIES, creature->GetEntry()))
+                continue;
+            state.vehicles.push_back({uint32(creature->GetGUID().GetCounter()), creature->GetEntry(),
+                                      creature->GetPositionX(), creature->GetPositionY(), creature->GetPositionZ(),
+                                      creature->GetOrientation(), uint32(creature->GetHealth()),
+                                      uint32(creature->GetMaxHealth())});
+        }
+
+        std::lock_guard<std::mutex> lock(telemetryStateMutex);
+        wintergraspStates[sessionKey] = std::move(state);
     }
 
     // Also called when a battleground ends (wowmin_telemetry_battlegroundscript).

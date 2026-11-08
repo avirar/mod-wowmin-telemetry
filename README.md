@@ -26,6 +26,10 @@ WMAP|name|mapId|instanceId|x|y|z|orientation|level|race|class|accountId|isBot|al
 mapType|difficulty|sessionStartedAt|groupId|isRaidGroup|subgroup|teamId|healthPct|powerType|powerPct|\
 targetGuid|targetType|targetName|roleMask|waitingForResurrect|battlegroundRole|wmoGroupId|gender|stateFlags
 WTRN|entry|name|mapId|instanceId|x|y|z|orientation|pathProgress|displayId|guid|period|flags|pathTime|keyFrames
+WOPW|worldStateId|value
+WWG|active|timerSeconds|defender|attacker
+WWGO|entry|x|y|z|health|maxHealth|damagedNumHits
+WWGV|guid|entry|x|y|z|orientation|health|maxHealth
 WTPA|transportGuid|guid|name|x|y|z|orientation|seat|time|time2
 WBG|mapId|instanceId|battlegroundTypeId|status|elapsedMs|remainingMs|winner|\
 allianceScore|hordeScore|alliancePlayers|hordePlayers|allianceAlive|hordeAlive|nextResurrectMs|\
@@ -36,10 +40,14 @@ WBOSS|mapId|instanceId|bossId|state|name
 WDEATH|mapId|instanceId|eventId|occurredAt|victimGuid|victimName|killerGuid|killerType|killerName
 WEVENT|mapId|instanceId|eventId|occurredAt|type|actorGuid|actorName|\
 targetGuid|targetType|targetName|valueId|valueName|amount
-WMAP_END|playerCount|transportCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount|transportPassengerCount
+WMAP_END|playerCount|transportCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount|transportPassengerCount|outdoorWorldStateCount|wintergraspStructureCount|wintergraspVehicleCount
 ```
 
-Version 9 grows `WTRN` to fifteen fields (adding the transport's object `guid`, route cycle `period` in ms,
+Version 10 adds the outdoor PvP overlay: `WOPW` records carry every outdoor PvP world state (the client's own
+POI icon selector: a zone's capture points, keeps, workshops, and towers), `WWG` carries Wintergrasp's
+battlefield state (active, timer in milliseconds, defender, attacker), `WWGO` each destructible Wintergrasp wall,
+tower, or door with its real hit points, and `WWGV` each Wintergrasp siege vehicle while one exists.
+`WMAP_END` gains three counts (world states, Wintergrasp structures, Wintergrasp vehicles). Version 9 grows `WTRN` to fifteen fields (adding the transport's object `guid`, route cycle `period` in ms,
 `flags` with bit 1 a static/animation transport such as an elevator and bit 2 a route inside an instance,
 `pathTime`, and `keyFrames`) and adds `WTPA` records: one per player standing on a transport, with the
 transport's `guid` (matching `WTRN`), the player's `guid` and name, their transport-local attachment offset
