@@ -268,6 +268,13 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 // byte of HighGuid in bits 24..31 and their counter in bits 0..23. The
 // existing player/creature flags still distinguish those two namespaces.
 // Game-object records have their own namespace and retain their low GUID.
+// Version 8 grows the WMG1 object entry to 60 bytes with the destructible
+// building's real hit points (the core's m_goValue.Building.Health and
+// MaxHealth) and its damaged-model threshold (building.damagedNumHits), so
+// the viewer shows 599999 / 600001 (99.99%) rather than a quantized percent;
+// the u8 percent beside them keeps older readers working.
+// Version 7 adds WMT2 (players standing on transports) and gives WMV2's
+// reserved u32 meaning: the vehicle's VehicleUIIndicator id (0: none).
 // Version 4 adds the vehicle's minimap blip to each WMV1 passenger entry.
 //   header (28 bytes): "WMS1", u8 version, u8 part, u8 partCount, u8 reserved,
 //     u32 mapId, u32 instanceId, u32 sequence, u32 serverTimeMs,
@@ -362,9 +369,21 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 // unoccupied vehicles too and flips a blip's variant as riders board and
 // leave.
 //   header (24 bytes): "WMV2", then as for paths, with u16 vehicleCount
-//   vehicle (9 bytes): u32 vehicleGuid (the vehicle's own unit ID, as in
-//     WMV1), u8 blip (the client's s_vehicleTextures index, as in WMV1;
-//     never 0xFF here), u32 reserved
+//   vehicle (17 bytes from version 8, 9 before): u32 vehicleGuid (the
+//     vehicle's own unit ID, as in WMV1), u8 blip (the client's
+//     s_vehicleTextures index, as in WMV1; never 0xFF here), u32
+//     seatIndicator (from version 7: the vehicle's VehicleUIIndicator id,
+//     the client's seat-indicator artwork; 0: none), u32 health, u32
+//     maxHealth (from version 8: the vehicle creature's real hit points)
+//
+// Players standing on a transport (a ship's deck, a zeppelin, an elevator;
+// not a vehicle seat) go in their own datagram with every snapshot while
+// any do; a player missing from it is not on a transport.
+//   header (24 bytes): "WMT2", then as for paths, with u16 passengerCount
+//   passenger (32 bytes): u32 transportGuid (the WMT1 entry's guid), u32
+//     playerGuid, f32 offsetX, f32 offsetY, f32 offsetZ, f32 offsetO (the
+//     server-maintained transport-local attachment), u32 time, u32 time2
+//     (the client's transport clock, for desync debugging)
 //
 // Game objects with a model (battleground banners and flags, doors, chests)
 // go in their own datagrams too, whenever one appears or changes and every
@@ -375,16 +394,23 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 //     f32 z, f32 rotation x, y, z, w (a quaternion), u16 scale (x 1000), u8
 //     type (GameobjectTypes), u8 state (GOState: 0 active, e.g. a door open,
 //     1 ready, 2 alternative), u8 flags (1 gone), u8 healthPct (version 6:
-//     a destructible building's health, 0 otherwise), u16 reserved
+//     a destructible building's health, 0 otherwise), u16 reserved, u32
+//     health, u32 maxHealth, u32 damagedNumHits (from version 8: the core's
+//     real hit points and damaged-model threshold, 0 for objects without
+//     health)
 //
 // The map's moving transports (ships, zeppelins, trams, elevators) go in
 // their own datagrams with every snapshot while the map has any; they are
 // recreated on the map they travel through, so one that is gone is simply
 // not re-sent.
 //   header (24 bytes): "WMT1", then as for paths, with u16 transportCount
-//   transport (36 bytes): u32 guid, u32 entry, f32 x, f32 y, f32 z,
-//     f32 orientation, u32 pathProgress (0..10000 through the current route
-//     cycle), u32 displayId, u16 reserved x2
+//   transport (48 bytes from version 7, 36 before): u32 guid, u32 entry,
+//     f32 x, f32 y, f32 z, f32 orientation, u32 pathProgress (0..10000
+//     through the current route cycle), u32 displayId, u32 period (the
+//     route cycle in ms), u32 pathTime (motion routes' total time, else 0),
+//     u16 keyFrames (motion routes only), u8 flags (1 a static/animation
+//     transport such as an elevator; 2 the route lives in an instance),
+//     u8 reserved, u16 reserved x2
 //
 // The harmful auras on each unit (for wowmin's nameplates) go in their own
 // datagrams: when a unit's list changes and every STREAM_DEBUFF_REFRESH_MS
@@ -426,7 +452,11 @@ uint32 GetStreamUnitId(ObjectGuid guid)
 //     Consecration; its cast-fired event then carries the area's duration in
 //     value, as a channel's does)
 
-constexpr uint8 STREAM_VERSION = 6;
+// Version 8 grows the WMG1 entry with a destructible building's real hit
+// points and the WMV2 entry with a vehicle creature's. Version 7 adds WMT2
+// (players standing on transports) and gives WMV2's reserved u32 meaning:
+// the vehicle's VehicleUIIndicator id.
+constexpr uint8 STREAM_VERSION = 8;
 constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
 constexpr std::size_t STREAM_MAX_SUBSCRIPTIONS = 64;
 constexpr std::size_t STREAM_MAX_DATAGRAM = 1200;
@@ -825,7 +855,14 @@ struct StreamGameObject
     uint8 type = 0;
     uint8 state = 0;
     bool gone = false;
+    // A destructible building's whole-percent health (kept for older
+    // readers) and, from version 8, the core's real hit points.
     uint8 healthPct = 0;
+    uint32 health = 0;
+    uint32 maxHealth = 0;
+    // The core's damaged-model threshold (building.damagedNumHits): the
+    // building reads damaged at or below it.
+    uint32 damagedNumHits = 0;
 };
 
 struct StreamTransport
@@ -838,6 +875,12 @@ struct StreamTransport
     float orientation = 0.0f;
     uint32 pathProgress = 0;
     uint32 displayId = 0;
+    uint32 period = 0;
+    uint32 pathTime = 0;
+    uint16 keyFrames = 0;
+    // Bit 1: a static (animation) transport, e.g. an elevator; bit 2: the
+    // route lives in an instance.
+    uint8 flags = 0;
 };
 
 struct StreamPassenger
@@ -854,6 +897,24 @@ struct StreamVehicleBlip
 {
     uint32 guid = 0;
     uint8 blip = 0xFF;
+    uint16 seatIndicator = 0;
+    // The vehicle creature's real hit points (version 8).
+    uint32 health = 0;
+    uint32 maxHealth = 0;
+};
+
+// A player standing on a transport (WMT2), with their transport-local
+// attachment offset and the client-reported transport clock.
+struct StreamTransportPassenger
+{
+    uint32 transportGuid = 0;
+    uint32 playerGuid = 0;
+    float offsetX = 0.0f;
+    float offsetY = 0.0f;
+    float offsetZ = 0.0f;
+    float offsetO = 0.0f;
+    uint32 time = 0;
+    uint32 time2 = 0;
 };
 
 struct StreamUnitAuras
@@ -1218,6 +1279,9 @@ std::vector<std::vector<uint8>> BuildGameObjectDatagrams(uint32 mapId, uint32 in
         AppendU8(entry, object.gone ? 1 : 0);
         AppendU8(entry, object.healthPct);
         AppendU16(entry, 0);
+        AppendU32(entry, object.health);
+        AppendU32(entry, object.maxHealth);
+        AppendU32(entry, object.damagedNumHits);
     }
     return PackEntries("WMG1", mapId, instanceId, serverTimeMs, entries);
 }
@@ -1230,7 +1294,7 @@ std::vector<std::vector<uint8>> BuildTransportDatagrams(uint32 mapId, uint32 ins
     for (StreamTransport const& transport : transports)
     {
         std::vector<uint8>& entry = entries.emplace_back();
-        entry.reserve(36);
+        entry.reserve(48);
         AppendU32(entry, transport.guid);
         AppendU32(entry, transport.entry);
         AppendF32(entry, transport.x);
@@ -1239,6 +1303,11 @@ std::vector<std::vector<uint8>> BuildTransportDatagrams(uint32 mapId, uint32 ins
         AppendF32(entry, transport.orientation);
         AppendU32(entry, transport.pathProgress);
         AppendU32(entry, transport.displayId);
+        AppendU32(entry, transport.period);
+        AppendU32(entry, transport.pathTime);
+        AppendU16(entry, transport.keyFrames);
+        AppendU8(entry, transport.flags);
+        AppendU8(entry, 0);
         AppendU16(entry, 0);
         AppendU16(entry, 0);
     }
@@ -1272,12 +1341,35 @@ std::vector<std::vector<uint8>> BuildVehicleBlipDatagrams(uint32 mapId, uint32 i
     for (StreamVehicleBlip const& vehicle : vehicles)
     {
         std::vector<uint8>& entry = entries.emplace_back();
-        entry.reserve(9);
+        entry.reserve(17);
         AppendU32(entry, vehicle.guid);
         AppendU8(entry, vehicle.blip);
-        AppendU32(entry, 0);
+        AppendU32(entry, vehicle.seatIndicator);
+        AppendU32(entry, vehicle.health);
+        AppendU32(entry, vehicle.maxHealth);
     }
     return PackEntries("WMV2", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildTransportPassengerDatagrams(
+    uint32 mapId, uint32 instanceId, uint32 serverTimeMs, std::vector<StreamTransportPassenger> const& passengers)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(passengers.size());
+    for (StreamTransportPassenger const& passenger : passengers)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(32);
+        AppendU32(entry, passenger.transportGuid);
+        AppendU32(entry, passenger.playerGuid);
+        AppendF32(entry, passenger.offsetX);
+        AppendF32(entry, passenger.offsetY);
+        AppendF32(entry, passenger.offsetZ);
+        AppendF32(entry, passenger.offsetO);
+        AppendU32(entry, passenger.time);
+        AppendU32(entry, passenger.time2);
+    }
+    return PackEntries("WMT2", mapId, instanceId, serverTimeMs, entries);
 }
 
 std::vector<std::vector<uint8>> BuildUnitAuraDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
@@ -1757,6 +1849,21 @@ struct TelemetryEvent
 
 // Where a live transport (ship, zeppelin, tram, elevator) is right now and
 // how far through its route it is, captured on the map's own thread.
+// A player standing on a transport (not riding a vehicle seat), with their
+// transport-local attachment offset for the debug table.
+struct TelemetryTransportPassenger
+{
+    uint32 guid;
+    std::string name;
+    float offsetX;
+    float offsetY;
+    float offsetZ;
+    float offsetO;
+    int8 seat;
+    uint32 time;
+    uint32 time2;
+};
+
 struct TelemetryTransport
 {
     uint32 entry;
@@ -1769,6 +1876,17 @@ struct TelemetryTransport
     float orientation;
     uint32 pathProgress;
     uint32 displayId;
+    uint32 guid;
+    // The route cycle (motion: path time; static: animation total), and
+    // whether it is an animation elevator or a spline ship/zeppelin/tram.
+    uint32 period;
+    bool staticTransport;
+    bool inInstance;
+    // Motion transports only: the route's total time and key-frame count.
+    uint32 pathTime;
+    uint32 keyFrames;
+    // The players aboard, sorted by name; empty when nobody is.
+    std::vector<TelemetryTransportPassenger> passengers;
 };
 
 std::unordered_map<uint64, TelemetryInstance> instanceStates;
@@ -1782,10 +1900,15 @@ std::unordered_map<uint64, std::vector<TelemetryTransport>> transportStates;
 // track milliseconds (motion transports since the route began, the
 // animation-based ones within the animation), so scale them by the cycle's
 // period.
+uint32 GetTransportPeriod(Transport const* transport)
+{
+    return transport->IsStaticTransport() ? static_cast<StaticTransport const*>(transport)->GetPeriod()
+                                          : static_cast<MotionTransport const*>(transport)->GetPeriod();
+}
+
 uint32 GetTransportCycleProgress(Transport const* transport)
 {
-    uint32 const period = transport->IsStaticTransport() ? static_cast<StaticTransport const*>(transport)->GetPeriod()
-                                                         : static_cast<MotionTransport const*>(transport)->GetPeriod();
+    uint32 const period = GetTransportPeriod(transport);
     if (!period)
         return 0;
     return uint32(uint64(transport->GetPathProgress() % period) * 10000 / period);
@@ -2065,7 +2188,7 @@ public:
             }
         }
 
-        handler->SendSysMessage("WMAP_VERSION|8");
+        handler->SendSysMessage("WMAP_VERSION|9");
         for (TelemetryPlayer const& player : players)
         {
             handler->PSendSysMessage(
@@ -2080,12 +2203,24 @@ public:
                 player.battlegroundRole, player.wmoGroupId, player.gender, player.stateFlags);
         }
 
+        std::size_t transportPassengerCount = 0;
         for (TelemetryTransport const& transport : transports)
         {
-            handler->PSendSysMessage("WTRN|{}|{}|{}|{}|{:.3f}|{:.3f}|{:.3f}|{:.3f}|{}|{}", transport.entry,
-                                     EscapeTelemetryField(transport.name), transport.mapId, transport.instanceId,
-                                     transport.positionX, transport.positionY, transport.positionZ,
-                                     transport.orientation, transport.pathProgress, transport.displayId);
+            uint8 const transportFlags = (transport.staticTransport ? 1 : 0) | (transport.inInstance ? 2 : 0);
+            handler->PSendSysMessage("WTRN|{}|{}|{}|{}|{:.3f}|{:.3f}|{:.3f}|{:.3f}|{}|{}|{}|{}|{}|{}|{}",
+                                     transport.entry, EscapeTelemetryField(transport.name), transport.mapId,
+                                     transport.instanceId, transport.positionX, transport.positionY,
+                                     transport.positionZ, transport.orientation, transport.pathProgress,
+                                     transport.displayId, transport.guid, transport.period, transportFlags,
+                                     transport.pathTime, transport.keyFrames);
+            for (TelemetryTransportPassenger const& passenger : transport.passengers)
+            {
+                handler->PSendSysMessage("WTPA|{}|{}|{}|{:.3f}|{:.3f}|{:.3f}|{:.3f}|{}|{}|{}", transport.guid,
+                                         passenger.guid, EscapeTelemetryField(passenger.name), passenger.offsetX,
+                                         passenger.offsetY, passenger.offsetZ, passenger.offsetO, passenger.seat,
+                                         passenger.time, passenger.time2);
+                ++transportPassengerCount;
+            }
         }
 
         std::size_t worldStateCount = 0;
@@ -2126,9 +2261,9 @@ public:
                                      EscapeTelemetryField(event.actorName), event.targetGuid, event.targetType,
                                      EscapeTelemetryField(event.targetName), event.valueId,
                                      EscapeTelemetryField(event.valueName), event.amount);
-        handler->PSendSysMessage("WMAP_END|{}|{}|{}|{}|{}|{}|{}|{}", players.size(), transports.size(),
+        handler->PSendSysMessage("WMAP_END|{}|{}|{}|{}|{}|{}|{}|{}|{}", players.size(), transports.size(),
                                  battlegrounds.size(), worldStateCount, instances.size(), bossCount, deaths.size(),
-                                 events.size());
+                                 events.size(), transportPassengerCount);
         return true;
     }
 };
@@ -2308,13 +2443,41 @@ private:
         std::vector<StreamGameObject> gameObjects;
         CollectGameObjects(map, *state, nowMs, gameObjects);
         std::vector<StreamTransport> transports;
+        std::vector<StreamTransportPassenger> transportPassengers;
         for (Transport* transport : map->GetAllTransports())
         {
             if (!transport->IsInWorld())
                 continue;
+            uint32 pathTime = 0;
+            uint16 keyFrames = 0;
+            bool inInstance = false;
+            if (MotionTransport const* motion = transport->ToMotionTransport())
+            {
+                if (TransportTemplate const* info = motion->GetTransportTemplate())
+                {
+                    pathTime = info->pathTime;
+                    keyFrames = uint16(std::min<std::size_t>(info->keyFrames.size(), 0xFFFF));
+                    inInstance = info->inInstance;
+                }
+            }
+            uint8 const flags = (transport->IsStaticTransport() ? 1 : 0) | (inInstance ? 2 : 0);
             transports.push_back({transport->GetGUID().GetCounter(), transport->GetEntry(), transport->GetPositionX(),
                                   transport->GetPositionY(), transport->GetPositionZ(), transport->GetOrientation(),
-                                  GetTransportCycleProgress(transport), transport->GetDisplayId()});
+                                  GetTransportCycleProgress(transport), transport->GetDisplayId(),
+                                  GetTransportPeriod(transport), pathTime, keyFrames, flags});
+            // Who is standing on it (not riding a vehicle seat): the map's
+            // own passenger set, read here on the map thread, with each
+            // rider's transport-local attachment offset.
+            for (WorldObject* passenger : transport->GetPassengers())
+            {
+                if (!passenger->IsPlayer())
+                    continue;
+                transportPassengers.push_back({uint32(transport->GetGUID().GetCounter()),
+                                               uint32(passenger->GetGUID().GetCounter()), passenger->GetTransOffsetX(),
+                                               passenger->GetTransOffsetY(), passenger->GetTransOffsetZ(),
+                                               passenger->GetTransOffsetO(), passenger->GetTransTime(),
+                                               passenger->m_movementInfo.transport.time2});
+            }
         }
         // Forget units that have gone, so a return is sent as new.
         auto gone = [&](auto const& entry)
@@ -2356,6 +2519,10 @@ private:
                               host, port);
         if (!transports.empty())
             streamSender.Send(BuildTransportDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), transports),
+                              host, port);
+        if (!transportPassengers.empty())
+            streamSender.Send(BuildTransportPassengerDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs),
+                                                               transportPassengers),
                               host, port);
         if (!debuffs.empty())
             streamSender.Send(BuildDebuffDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), debuffs), host,
@@ -2504,9 +2671,20 @@ private:
             seen.insert(guid);
             G3D::Quat const rotation = object->GetWorldRotation();
             // Only destructible buildings (IoC's gates and walls) carry
-            // health; the gameobject's anim progress tracks its fraction.
-            uint8 const healthPct =
-                type == GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING ? uint8(object->GetGoAnimProgress() * 100 / 255) : 0;
+            // health. The core keeps the real values (MaxHealth is the
+            // template's intactNumHits + damagedNumHits); the client-facing
+            // anim progress (0..255) is just Health * 255 / MaxHealth, so
+            // send both the real numbers and the whole percent.
+            uint32 health = 0;
+            uint32 maxHealth = 0;
+            uint32 damagedNumHits = 0;
+            if (type == GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING)
+            {
+                health = object->GetGOValue()->Building.Health;
+                maxHealth = object->GetGOValue()->Building.MaxHealth;
+                damagedNumHits = object->GetGOInfo()->building.damagedNumHits;
+            }
+            uint8 const healthPct = maxHealth ? uint8(uint64(health) * 100 / maxHealth) : 0;
             StreamGameObject entry{guid,
                                    object->GetEntry(),
                                    object->GetDisplayId(),
@@ -2518,11 +2696,16 @@ private:
                                    uint8(type),
                                    uint8(object->GetGoState()),
                                    false,
-                                   healthPct};
+                                   healthPct,
+                                   health,
+                                   maxHealth,
+                                   damagedNumHits};
             std::size_t signature = std::hash<uint32>{}(entry.displayId);
             auto mix = [&](auto value) { MixSignature(signature, value); };
             mix(entry.state);
             mix(entry.healthPct);
+            mix(entry.health);
+            mix(entry.maxHealth);
             mix(entry.scale);
             mix(int32(entry.x * 10.0f));
             mix(int32(entry.y * 10.0f));
@@ -2907,8 +3090,10 @@ private:
             if (Vehicle* vehicle = creature->GetVehicleKit())
             {
                 uint8 const blip = VehicleBlip(vehicle);
-                if (blip != 0xFF)
-                    vehicleBlips.push_back({guid, blip});
+                VehicleEntry const* info = vehicle->GetVehicleInfo();
+                if (blip != 0xFF && info)
+                    vehicleBlips.push_back({guid, blip, uint16(info->m_uiSeatIndicatorType),
+                                            uint32(creature->GetHealth()), uint32(creature->GetMaxHealth())});
             }
         }
         // Forget despawned creatures, so a respawn is sent as new.
@@ -2927,10 +3112,43 @@ public:
         {
             if (!transport->IsInWorld())
                 continue;
-            transports.push_back({transport->GetEntry(), transport->GetGOInfo()->name, map->GetId(),
-                                  map->GetInstanceId(), transport->GetPositionX(), transport->GetPositionY(),
-                                  transport->GetPositionZ(), transport->GetOrientation(),
-                                  GetTransportCycleProgress(transport), transport->GetDisplayId()});
+            // Who is standing on it: the map's own passenger set, read here
+            // on the map thread. Each rider's attachment offset is the
+            // server-maintained transport-local position, not a guess.
+            std::vector<TelemetryTransportPassenger> passengers;
+            for (WorldObject* passenger : transport->GetPassengers())
+            {
+                if (!passenger->IsPlayer())
+                    continue;
+                passengers.push_back({uint32(passenger->GetGUID().GetCounter()), passenger->ToPlayer()->GetName(),
+                                      passenger->GetTransOffsetX(), passenger->GetTransOffsetY(),
+                                      passenger->GetTransOffsetZ(), passenger->GetTransOffsetO(),
+                                      passenger->GetTransSeat(), passenger->GetTransTime(),
+                                      passenger->m_movementInfo.transport.time2});
+            }
+            std::sort(passengers.begin(), passengers.end(),
+                      [](TelemetryTransportPassenger const& left, TelemetryTransportPassenger const& right)
+                      { return left.name < right.name; });
+            // Motion transports also know their route: total time, key
+            // frames, and whether the route lives in an instance.
+            uint32 pathTime = 0;
+            uint32 keyFrames = 0;
+            bool inInstance = false;
+            if (MotionTransport const* motion = transport->ToMotionTransport())
+            {
+                if (TransportTemplate const* info = motion->GetTransportTemplate())
+                {
+                    pathTime = info->pathTime;
+                    keyFrames = uint32(info->keyFrames.size());
+                    inInstance = info->inInstance;
+                }
+            }
+            transports.push_back(
+                {transport->GetEntry(), transport->GetGOInfo()->name, map->GetId(), map->GetInstanceId(),
+                 transport->GetPositionX(), transport->GetPositionY(), transport->GetPositionZ(),
+                 transport->GetOrientation(), GetTransportCycleProgress(transport), transport->GetDisplayId(),
+                 uint32(transport->GetGUID().GetCounter()), GetTransportPeriod(transport),
+                 transport->IsStaticTransport(), inInstance, pathTime, keyFrames, std::move(passengers)});
         }
         std::lock_guard<std::mutex> lock(telemetryStateMutex);
         transportStates[sessionKey] = std::move(transports);

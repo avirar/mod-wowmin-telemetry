@@ -21,11 +21,12 @@ The response protocol is line-oriented and versioned. Long layouts below use `\`
 actual wire records occupy one line, with no continuation character:
 
 ```text
-WMAP_VERSION|8
+WMAP_VERSION|9
 WMAP|name|mapId|instanceId|x|y|z|orientation|level|race|class|accountId|isBot|alive|inCombat|\
 mapType|difficulty|sessionStartedAt|groupId|isRaidGroup|subgroup|teamId|healthPct|powerType|powerPct|\
 targetGuid|targetType|targetName|roleMask|waitingForResurrect|battlegroundRole|wmoGroupId|gender|stateFlags
-WTRN|entry|name|mapId|instanceId|x|y|z|orientation|pathProgress|displayId
+WTRN|entry|name|mapId|instanceId|x|y|z|orientation|pathProgress|displayId|guid|period|flags|pathTime|keyFrames
+WTPA|transportGuid|guid|name|x|y|z|orientation|seat|time|time2
 WBG|mapId|instanceId|battlegroundTypeId|status|elapsedMs|remainingMs|winner|\
 allianceScore|hordeScore|alliancePlayers|hordePlayers|allianceAlive|hordeAlive|nextResurrectMs|\
 allianceStrategy|hordeStrategy
@@ -35,10 +36,15 @@ WBOSS|mapId|instanceId|bossId|state|name
 WDEATH|mapId|instanceId|eventId|occurredAt|victimGuid|victimName|killerGuid|killerType|killerName
 WEVENT|mapId|instanceId|eventId|occurredAt|type|actorGuid|actorName|\
 targetGuid|targetType|targetName|valueId|valueName|amount
-WMAP_END|playerCount|transportCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount
+WMAP_END|playerCount|transportCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount|transportPassengerCount
 ```
 
-Version 8 adds `WTRN` records: every live transport (ship, zeppelin, tram, elevator) per map, captured once
+Version 9 grows `WTRN` to fifteen fields (adding the transport's object `guid`, route cycle `period` in ms,
+`flags` with bit 1 a static/animation transport such as an elevator and bit 2 a route inside an instance,
+`pathTime`, and `keyFrames`) and adds `WTPA` records: one per player standing on a transport, with the
+transport's `guid` (matching `WTRN`), the player's `guid` and name, their transport-local attachment offset
+(`x`, `y`, `z`, `orientation`), seat (always -1 for a transport), and the client's transport clock
+(`time`, `time2`, for desync debugging). `WMAP_END` gains a final `transportPassengerCount`. Version 8 adds `WTRN` records: every live transport (ship, zeppelin, tram, elevator) per map, captured once
 per map update, with `pathProgress` 0–10000 through the transport's current route cycle and the game-object
 `displayId` so a reader can draw its model. Version 7 adds authoritative battleground flag-carrier state (`32`) while a player holds the Warsong,
 Silverwing, or Netherstorm flag aura. The bit clears with the aura when the flag is dropped, captured,
@@ -100,7 +106,19 @@ subscriptions, queued combat events, and per-stream caches. Re-enabling requires
 text history is unaffected. Failed destination validation/socket opening is retried at most once every five seconds
 while watched; changing host or port bypasses the cooldown. No alternate destination is substituted.
 
-Every datagram starts with a four-byte magic and a version byte (currently 6). Stream version 6 gives the
+Every datagram starts with a four-byte magic and a version byte (currently 8). Stream version 8 grows the `WMG1`
+object entry to 60 bytes with a destructible building's real hit points (`health`, `maxHealth`) and its damaged-model
+threshold (`damagedNumHits`) from the core's `m_goValue.Building`, so a damaged IoC gate reads 599999 / 600001
+(99.99%) instead of a percent quantized by the client-facing 0..255 anim progress; the existing `u8` percent beside
+them keeps older readers working. The `WMV2` vehicle entry grows from 9 to 17 bytes with the same real `health` and
+`maxHealth` for a vehicle creature, so a Demolisher's hit points show beside its seats. Stream version 7 adds `WMT2`: the
+players standing on each transport (a ship's deck, a zeppelin, an elevator; not a vehicle seat), with each rider's
+transport-local attachment offset (x, y, z, orientation) and the client's transport clock (time, time2), so WoWMin can
+show a debug table and diagnose desyncs. `WMT1` entries grow to 48 bytes, adding the transport's route cycle period,
+the motion route's total path time and key-frame count, and static/instance flags. It also gives `WMV2`'s reserved
+`u32` meaning: the vehicle's `VehicleUIIndicator` id from `Vehicle.dbc`, 0 for none, so WoWMin can draw the client's
+seat-indicator artwork (Demolisher, Siege Engine) with the occupied seats lit. The `WMV2` entry stays 9 bytes.
+Stream version 6 gives the
 `WMG1` object entry's reserved byte meaning: a destructible building's (IoC's gates and walls') health
 percent, 0 for objects without health, so a damaged gate reads below 100 before it is destroyed. Stream
 version 5 adds `WMV2`: every
@@ -113,10 +131,12 @@ and its 24-bit counter in bits 0–23 (creature `0x30`, pet `0x40`, vehicle `0x5
 player/creature flags distinguish the player and non-player namespaces. Game-object records retain their own low-GUID
 namespace. These are runtime stream identities, not database spawn IDs. Text telemetry is unchanged.
 
-Deploy the v6-capable WoWMin reader before this module; it accepts v1 through v6 for every packet
-family (v6 reinterprets one of the `WMG1` entry's reserved bytes as the object's health percent, so the
-entry stays 48 bytes; v5's only other change was the added `WMV2` magic). Older readers
-reject v6 rather than mixing incompatible entries. Live-view caches may
+Deploy the v8-capable WoWMin reader before this module; it accepts v1 through v8 for every packet
+family (v8 grows the `WMG1` entry from 48 to 60 bytes and the `WMV2` entry from 9 to 17 bytes with the real hit
+points; v7 adds the `WMT2` magic and reinterprets `WMV2`'s reserved `u32` as the vehicle's seat-indicator id, so
+both entry layouts are unchanged; v6 reinterprets one of the `WMG1` entry's reserved bytes as the object's health
+percent, so the entry stays 48 bytes; v5's only other change was the added `WMV2` magic). Older readers
+reject v8 rather than mixing incompatible entries. Live-view caches may
 retain old IDs until their normal expiry after a module upgrade. Stream version 2 adds the core LFG
 role mask to each `WMS1` player record so roles remain available with WoWMin's character-database
 snapshot fallback. Unlike text telemetry, stream roles may use mod-playerbots
@@ -135,9 +155,10 @@ All layouts are little-endian and documented beside the code in `src/WowMinTelem
 | `WME1` | Combat events: casts, notable auras, swings, damage, heals | With the next snapshot after they happen |
 | `WMU1` | Auras with spell art on each unit | When a unit's list changes, and every 5 seconds |
 | `WMV1` | Vehicle passengers, their seats, and each vehicle's minimap blip | With every snapshot while any ride |
-| `WMV2` | Every minimap-blipping vehicle (occupied or not) and its current blip | With every snapshot while the map has one |
+| `WMV2` | Every minimap-blipping vehicle (occupied or not), its blip, seat-indicator id, and real health | With every snapshot while the map has one |
 | `WMG1` | Modeled game objects: banners, flags, doors, chests | On sight/change; refresh every 10 seconds |
-| `WMT1` | Moving transports: position, orientation, route progress, display | With every snapshot while the map has any |
+| `WMT1` | Moving transports: position, orientation, route progress, display, period, path time, flags | With every snapshot while the map has any |
+| `WMT2` | Players standing on each transport, with their attachment offsets and transport clock | With every snapshot while any stand on one |
 | `WMD1` | Harmful auras on each unit, for nameplates | When a unit's list changes, and every 3 seconds |
 | `WMR1` | Raid markers set by the instance's groups | When they change, and every 2 seconds |
 
